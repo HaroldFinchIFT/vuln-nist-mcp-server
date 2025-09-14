@@ -118,10 +118,10 @@ Params: {
 ```
 vuln-nist-mcp-server/
 ├── Dockerfile
-└── LICENSE
+├── LICENSE
 ├── README.md
 ├── requirements.txt
-├── vuln_nist_mcp_server.py
+└── vuln_nist_mcp_server.py
 ```
 
 ## Security Considerations
