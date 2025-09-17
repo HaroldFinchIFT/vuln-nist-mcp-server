@@ -24,7 +24,7 @@ logger = logging.getLogger("vuln-nist-mcp-server")
 mcp = FastMCP("vuln-nist-mcp-server")
 
 # Configuration
-NVD_BASE = os.environ.get("NVD_BASE_URL", "https://services.nvd.nist.gov/rest/json/cves")
+NVD_BASE = os.environ.get("NVD_BASE_URL", "https://services.nvd.nist.gov/rest/json")
 NVD_VERSION = os.environ.get("NVD_VERSION", "/2.0")
 API_TIMEOUT = int(os.environ.get("NVD_API_TIMEOUT", "10"))
 
@@ -73,23 +73,108 @@ def _format_vuln_entry(v):
 # === MCP TOOLS ===
 
 @mcp.tool()
-async def search_cves(keyword: str = "", resultsPerPage: int = 20,
-                      startIndex: int = 0, recent_days: int = 30) -> str:
+async def get_temporal_context() -> str:
     """
-    Search CVEs by keyword in description, optionally filtering by recent days.
-    If recent_days > 120, the period is chunked into multiple queries (max 120 days each)
-    and results are aggregated. Queries are executed in parallel.
-    """
-    keyword = _safe_str(keyword)
-    if not keyword:
-        return "❌ Error: keyword parameter is required"
+    Get current date and temporal context when it needed.
 
-    end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=recent_days)
+    **USAGE**: Call this tool FIRST when user asks for time-relative question like "this year", "last year", "6 months ago", etc.
+
+    Returns current date context and examples for constructing specific date parameters.
+    """
+    now = datetime.now(timezone.utc)
+    current_year = now.year
+    current_date = now.strftime("%Y-%m-%dT%H:%M:%S")
+
+    this_year_start = f"{current_year}-01-01T00:00:00"
+    last_year_start = f"{current_year - 1}-01-01T00:00:00"
+    last_year_end = f"{current_year - 1}-12-31T23:59:59"
+    six_months_ago = (now - timedelta(days=180)).strftime("%Y-%m-%dT00:00:00")
+    three_months_ago = (now - timedelta(days=90)).strftime("%Y-%m-%dT00:00:00")
+
+    return f"""📅 **CURRENT TEMPORAL CONTEXT**
+        
+        🗓️ **Current date**: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}
+        📊 **Current year**: {current_year}
+        
+        🎯 **COMMON TIME PERIOD MAPPINGS**:
+        
+        ▪️ **"This year"**: 
+           start_date="{this_year_start}", end_date="{current_date}"
+        
+        ▪️ **"Last year"**: 
+           start_date="{last_year_start}", end_date="{last_year_end}"
+        
+        ▪️ **"Last 6 months"**: 
+           start_date="{six_months_ago}", end_date="{current_date}"
+        
+        ▪️ **"Last 3 months"**: 
+           start_date="{three_months_ago}", end_date="{current_date}"
+        
+        ▪️ **"2 years ago ({current_year - 2})"**: 
+           start_date="{current_year - 2}-01-01T00:00:00", end_date="{current_year - 2}-12-31T23:59:59"
+        
+        ▪️ **"Q1 this year"**: 
+           start_date="{current_year}-01-01T00:00:00", end_date="{current_year}-03-31T23:59:59"
+        
+        ▪️ **"Q1 last year"**: 
+           start_date="{current_year - 1}-01-01T00:00:00", end_date="{current_year - 1}-03-31T23:59:59"
+        
+        💡 **Usage**: Copy the appropriate value above and use them directly in the other tools call when it is needed.
+        """
+
+@mcp.tool()
+async def search_cves(
+        keyword: str = "",
+        resultsPerPage: int = 20,
+        startIndex: int = 0,
+        recent_days: int | None = None, #deprecated
+        last_days: int | None = None,
+        start_date: str = "",
+        end_date: str = "",
+) -> str:
+    """
+    Search CVEs by keyword in description, with flexible time filtering.
+
+    **IMPORTANT**: For time-relative queries (this year, last year, etc.), call get_temporal_context() FIRST to get current date information.
+
+    **Date filtering logic (in priority order):**
+    - If start_date and end_date are provided → use them directly
+    - Else if last_days is provided → calculate start_date = now - last_days
+    - Else fallback to last 30 days
+
+    **Technical notes:**
+    - If the time period > 120 days, queries are split into 120-day chunks
+    - start_date, end_date: Use ISO 8601 format: "YYYY-MM-DDTHH:MM:SS"
+    - recent_days parameter is deprecated, use last_days instead.
+    """
+
+    last_days = last_days if last_days is not None else recent_days
+
+    keyword = _safe_str(keyword)
+    now = datetime.now(timezone.utc)
+
+    if end_date and end_date.strip():
+        try:
+            end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+        except ValueError:
+            return "❌ Error: end_date must be valid ISO-8601 format"
+    else:
+        end_date = now
+
+    if start_date and start_date.strip():
+        try:
+            start_date = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+        except ValueError:
+            return "❌ Error: start_date must be valid ISO-8601 format"
+    else:
+        if last_days is not None:
+            start_date = end_date - timedelta(days=last_days)
+        else:
+            start_date = end_date - timedelta(days=30)
 
     url = f"{NVD_BASE}/cves{NVD_VERSION}"
 
-    async def fetch_chunk(chunk_start, chunk_end):
+    async def fetch_chunk(chunk_start: datetime, chunk_end: datetime):
         pubStartDate = chunk_start.strftime("%Y-%m-%dT%H:%M:%S.000")
         pubEndDate = chunk_end.strftime("%Y-%m-%dT%H:%M:%S.000")
 
@@ -109,6 +194,7 @@ async def search_cves(keyword: str = "", resultsPerPage: int = 20,
             return resp.json()
 
     try:
+        # Generate chunks (max 120 days each)
         chunk_size = timedelta(days=120)
         chunks = []
         chunk_start = start_date
@@ -121,7 +207,7 @@ async def search_cves(keyword: str = "", resultsPerPage: int = 20,
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         total = 0
-        results = []
+        results: list[dict] = []
 
         for resp in responses:
             if isinstance(resp, Exception):
@@ -132,6 +218,11 @@ async def search_cves(keyword: str = "", resultsPerPage: int = 20,
             total += data.get("totalResults", 0)
             results.extend(data.get("vulnerabilities", []) or [])
 
+        results.sort(
+            key=lambda v: v.get("cve", {}).get("published", ""),
+            reverse=True
+        )
+
         lines = [f"🔍 Search results for \"{keyword}\" - total matches: {total}"]
         if not results:
             lines.append("⚠️ No vulnerabilities returned for the given params.")
@@ -141,7 +232,8 @@ async def search_cves(keyword: str = "", resultsPerPage: int = 20,
 
         lines.append(
             f"📄 Aggregated across {len(chunks)} chunk(s) "
-            f"(parallelized), period={recent_days} days, resultsPerPage={resultsPerPage}"
+            f"(parallelized), period={start_date.date()} → {end_date.date()}, "
+            f"resultsPerPage={resultsPerPage}"
         )
         return "\n".join(lines)
 
@@ -312,15 +404,21 @@ async def kevs_between(
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         total = 0
-        vulns = []
+        vulns: list[dict] = []
 
         for resp in responses:
             if isinstance(resp, Exception):
                 logger.error(f"KEV chunk failed: {resp}")
                 continue
+
             data = cast(dict, resp)
             total += data.get("totalResults", 0)
             vulns.extend(data.get("vulnerabilities", []) or [])
+
+        vulns.sort(
+            key=lambda v: v.get("cve", {}).get("published", ""),
+            reverse=True
+        )
 
         lines = [
             f"🔥 KEV CVEs added between {kevStartDate} and {kevEndDate} - total matches (aggregated): {total}"
@@ -410,15 +508,22 @@ async def cve_change_history(
             tasks = [fetch_chunk(cs, ce) for cs, ce in chunks]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-            changes = []
             total = 0
+            changes: list[dict] = []
+
             for resp in responses:
                 if isinstance(resp, Exception):
                     logger.error(f"CVE change chunk failed: {resp}")
                     continue
+
                 data = cast(dict, resp)
                 total += data.get("totalResults", 0)
                 changes.extend(data.get("cveChanges", []) or [])
+
+        changes.sort(
+            key=lambda v: v.get("change", {}).get("created", ""),
+            reverse=True
+        )
 
         lines = [f"🕘 CVE Change History - total events: {total}"]
         if not changes:
