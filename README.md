@@ -162,6 +162,7 @@ Params: {
 ```
 vuln-nist-mcp-server/
 ├── Dockerfile
+├── glama.json
 ├── LICENSE
 ├── nvd_logo.png
 ├── README.md
